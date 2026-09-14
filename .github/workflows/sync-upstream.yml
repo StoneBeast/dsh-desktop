@@ -202,9 +202,11 @@ jobs:
               echo
               echo 'Add **Workflows: Read and write** to the fine-grained PAT, update the'
               echo '`UPSTREAM_SYNC_TOKEN` secret with the new token, and re-run this probe.'
-            } >> "$GITHUB_STEP_SUMMARY"
+            } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
             exit 1
           fi
           git push origin --delete "$branch"
-          echo '### Token OK' >> "$GITHUB_STEP_SUMMARY"
-          echo 'The token can write `.github/workflows`, so syncs that touch upstream CI will push.' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '### Token OK'
+            echo 'The token can write `.github/workflows`, so syncs that touch upstream CI will push.'
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
