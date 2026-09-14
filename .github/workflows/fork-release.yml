@@ -20,6 +20,10 @@ on:
         required: false
         default: true
         type: boolean
+      tag:
+        description: 'Release tag to create (default v<version>-fork.1); raise the suffix to rebuild'
+        required: false
+        type: string
   push:
     tags:
       - 'v*'
@@ -44,6 +48,7 @@ jobs:
         shell: bash
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           pkg="$(node -p "require('./dsh-plugin-desktop/package.json').version")"
@@ -60,14 +65,21 @@ jobs:
               echo "::error::tag '$tag' does not match dsh-plugin-desktop/package.json version '$pkg' (expected v$pkg or v$pkg-fork.N)"
               exit 1
             fi
-            echo "tag=$tag" >> "$GITHUB_OUTPUT"
           else
             if [[ "${INPUT_VERSION:-$pkg}" != "$pkg" ]]; then
               echo "::error::release version '${INPUT_VERSION:-}' does not match dsh-plugin-desktop/package.json version '$pkg'"
               exit 1
             fi
-            echo "tag=v$pkg" >> "$GITHUB_OUTPUT"
+            # A rebuild reuses the version but needs a fresh tag; `gh release
+            # create` creates the tag at the checked-out commit.
+            tag="${INPUT_TAG:-v$pkg-fork.1}"
+            base="$(printf '%s' "${tag#v}" | sed -E 's/-fork\.[0-9]+$//')"
+            if [[ "$base" != "$pkg" ]]; then
+              echo "::error::tag '$tag' does not match dsh-plugin-desktop/package.json version '$pkg'"
+              exit 1
+            fi
           fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$pkg" >> "$GITHUB_OUTPUT"
 
   windows:
@@ -185,3 +197,36 @@ jobs:
                  --notes "Fork build of DSH Desktop $VERSION, including the PR #946 opencode-go session header fix." \
                  --target "$GITHUB_SHA"
           gh release upload "$TAG" release-assets/* --clobber
+
+  # Repoint the update feed only after both platform asset sets are published, so
+  # the app can never be told about a version whose installer is not there. This
+  # is the only place that writes the feed; the sync workflow deliberately does not
+  # (merging a release bumps the version, which would advertise an unbuilt release).
+  feed:
+    needs: [resolve, windows, macos]
+    if: needs.windows.result == 'success' && needs.macos.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: master
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.23.2
+      - name: Advertise the released version
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          node fork/repoint-updates.mjs --feed-only
+          if git diff --quiet -- fork/update-feed; then
+            echo "The feed already advertises \`$VERSION\`." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git add fork/update-feed
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "chore(update-feed): advertise $VERSION"
+          git push origin HEAD:master
+          echo "The feed now advertises \`$VERSION\`." >> "$GITHUB_STEP_SUMMARY"

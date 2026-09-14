@@ -13,8 +13,15 @@
  *
  * Usage:
  *   node fork/repoint-updates.mjs --repo <owner>/<name> [--branch master]
+ *   node fork/repoint-updates.mjs --urls-only      # source constants only, never the feed
  *   node fork/repoint-updates.mjs --feed-only
- *   node fork/repoint-updates.mjs --restore          # back to upstream endpoints
+ *   node fork/repoint-updates.mjs --restore        # back to upstream endpoints
+ *
+ * `--urls-only` exists for the upstream-sync path: merging a new upstream release
+ * bumps the version in package.json, and regenerating the feed then would
+ * advertise a version whose Release does not exist yet -- the app would offer an
+ * update, download the previous installer, and loop. Only the release workflow,
+ * which runs after the assets are published, may write the feed.
  *
  * Downloads use `releases/latest/download/<asset>`, which GitHub answers with a
  * 302 to the asset. The Desktop downloader follows redirects, and it validates
@@ -46,10 +53,11 @@ const fail = message => {
 }
 
 function parseArgs(argv) {
-  const options = { branch: 'master', feedOnly: false, restore: false, repo: undefined }
+  const options = { branch: 'master', feedOnly: false, restore: false, urlsOnly: false, repo: undefined }
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
     if (arg === '--feed-only') options.feedOnly = true
+    else if (arg === '--urls-only') options.urlsOnly = true
     else if (arg === '--restore') options.restore = true
     else if (arg === '--repo') options.repo = argv[++index]
     else if (arg.startsWith('--repo=')) options.repo = arg.slice('--repo='.length)
@@ -171,7 +179,7 @@ function main() {
   }
 
   applyEdits(edits, changed)
-  if (!options.restore) writeFeeds(changed)
+  if (!options.restore && !options.urlsOnly) writeFeeds(changed)
   report(changed, options)
 }
 

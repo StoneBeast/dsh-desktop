@@ -129,26 +129,19 @@ node fork/repoint-updates.mjs --feed-only   # 只刷新版本号文件
 
 ## 4. 自动拉取上游更新
 
-`sync-upstream.yml` 每天 03:00 UTC 把 `upstream/master` **合并**进本 fork 的 `master`。
+`sync-upstream.yml` 每天 03:00 UTC（北京 11:00）把 `upstream/master` **合并**进本 fork 的 `master`，并自动修复 fork 自己的那两处改动（补丁接线、更新源 URL）。
 
-注意：因为 fork 上多了补丁提交，分支一定是 diverged 的，**GitHub 网页上的 "Sync fork" 按钮只能快进、用不了**，必须走真正的 merge，这就是该工作流存在的原因。
+注意：因为 fork 上多了补丁提交，分支一定是 diverged 的，**GitHub 网页上的 "Sync fork" 按钮只能快进、用不了**，必须走真正的 merge。
 
-### 两个必须知道的坑
+两件必须知道的：
 
-1. **工作流文件需要 PAT。** 默认的 `GITHUB_TOKEN` 没有 `workflows` 权限，如果上游改动了 `.github/workflows/ci.yml`，push 会被拒绝。设置 Secrets → `UPSTREAM_SYNC_TOKEN`（fine-grained PAT，勾选 Contents: write + Workflows: write）即可。
-2. **上游升运行时会静默丢掉补丁。** 上游 `upstream.json` 的 `runtimePackageVersion` 一旦从 `0.1.5-rc.2` 变成新版本，`patches/dsh-llm-pi-ai@0.1.5-rc.2.patch` 就不再被引用，修复**悄悄消失**，而所有常规检查仍然通过。工作流因此在 push 之前先跑 `fork/verify-patch-retained.mjs`，它会：
+1. **工作流文件需要 PAT。** 默认 `GITHUB_TOKEN` 没有 `workflows` 权限，上游一旦改动 `.github/workflows/` 下的文件，push 会被拒绝。设置见第 7 节。
+2. **上游升运行时会动到 patch 接线，这一步是自动的。** 上游 `upstream.json` 的 `runtimePackageVersion` 变化后，`patches/dsh-llm-pi-ai@<旧>.patch` 就不再被引用。`fork/sync-upstream.mjs` 会把补丁改名到新版本并对着实际 tarball 验证；若上游自己修好了这个 bug，它会直接删掉补丁而不是重复修。只有补丁**真的无法应用**时才停下来交给人工（见第 8 节的表格）。
 
-   - 断言补丁文件名与当前运行时版本一致；
-   - 断言两条 resolution 仍是 `patch:` 且指向该补丁；
-   - 把补丁拿去对**实际 vendored tarball** 做 `git apply --check`。
-
-   任何一条不过就中止推送、开一个 issue 并给出重新移植的步骤，fork 保持原样。
-
-### 合并冲突
-
-上游若改了 `package.json` resolutions 的相邻行，merge 会冲突，工作流会 `merge --abort` 并报错退出，不会留下半个合并。按提示本地解决后重跑即可。
+合并冲突也不再需要人工：上游每次发布都会重写 `package.json` 里补丁所在的那几行，脚本会逐文件检查「fork 侧相对 merge base 是否只动了 fork 自己的值」，成立才自动取上游版本并重新接线，不成立就中止并开 issue。
 
 ---
+
 
 ## 5. 本地校验命令
 
@@ -196,8 +189,61 @@ README.i18n.yaml is stale for README.md: expected ebded1c7..., recorded 6da97144
 
 处理建议：**保持 `ci.yml` 与上游一致、不要改它**（改了以后每次同步都要冲突）。等上游修好 README，下一次同步就会把修复带过来，CI 自动转绿。若觉得红叉吵，可以在 fork 的 Actions 页面手动 disable 这个 workflow，不需要改文件。
 
-## 7. 需要手动做的一件事：同步用的 PAT
+## 7. 同步用的 PAT（`UPSTREAM_SYNC_TOKEN`）
 
 `sync-upstream.yml` 默认使用 `GITHUB_TOKEN`，它**没有 `workflows` 权限**。上游只要改动了 `.github/workflows/` 下的任何文件，合并后的 push 就会被拒绝（工作流会打印出这条原因，不会留下半个合并）。
 
-设置一次即可：仓库 **Settings → Secrets and variables → Actions → New repository secret**，名称 `UPSTREAM_SYNC_TOKEN`，值是 fine-grained PAT，权限勾选 **Contents: Read and write** 与 **Workflows: Read and write**。工作流检测到该 secret 就会优先使用它。
+**「创建了一个 PAT」和「把它存成仓库 secret」是两件事，两个都要做。**
+
+1. 建 fine-grained PAT：GitHub → 右上头像 → Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → Generate new token。
+   - **Resource owner** 选你自己的账号
+   - **Repository access** → Only select repositories → 勾 `dsh-desktop`
+   - **Permissions → Repository permissions**：`Contents` = **Read and write**，`Workflows` = **Read and write**（这一项是必须的，它在列表靠下的位置）
+2. 存进仓库：`github.com/StoneBeast/dsh-desktop` → **Settings** → 左侧 **Secrets and variables** → **Actions** → **New repository secret**
+   - Name 必须**逐字符**是 `UPSTREAM_SYNC_TOKEN`
+   - Secret 填第 1 步生成的 token（`github_pat_` 开头）
+
+两个常见错法：把 token 建成了 **Variables**（不是 Secret）——变量不会注入 `secrets.*`；或者建在 **Environments** 下而不是仓库级。
+
+**怎么确认生效**：手动跑一次 **Actions → Sync upstream → Run workflow**，展开 `Sync upstream and re-wire the fork patch` 步骤。若输出 `sync-upstream: fork already contains upstream ...`，说明同步链路通了；token 是否被采用只有在真正需要推 workflow 文件时才会体现（届时失败信息会直接点名这个 secret）。
+
+## 8. 自动化流水线
+
+三个工作流串成一条链，各管一段：
+
+```
+Sync upstream   每天 03:00 UTC（北京 11:00）或手动
+   │  合并 upstream/master，只在能证明冲突属于 fork 自身时才自动解冲突
+   │  重移植 vendored 补丁、重建 yarn.lock、跑门禁
+   ↓  通过才 push；不通过则中止并开 issue（master 保持可构建）
+Auto release    Sync upstream 成功后自动触发
+   │  若 master 的版本号还没有对应 Release，就打 tag v<version>-fork.N
+   ↓
+Fork Release    由 tag 触发
+   │  Windows NSIS + portable、macOS 通用 DMG，跑真实产品门禁
+   ↓  两个平台都发布成功
+                更新 update-feed，让应用开始提示新版本
+```
+
+### 三种上游变化各自会发生什么
+
+| 上游情况 | 自动发生 | 需要你 |
+| --- | --- | --- |
+| 有新提交、无新发布 | 合并进 master，**不构建** | 不用管 |
+| 新发布且补丁可沿用（含升运行时） | 合并 → 自动把补丁改名到新运行时版本 → 重建锁文件 → 打 tag → 构建 → 发布 → 更新 feed | 不用管；等约 40 分钟拿到新安装包 |
+| 新发布且上游自己修了这个 bug | 合并 → **自动删除补丁**、resolution 还原为 `file:` → 正常构建发布 | 不用管 |
+| 新发布但补丁无法应用（上游大改了那段代码） | 合并中止、master 不变、自动开一个 issue | 手工重移植补丁，然后重跑 Sync upstream |
+
+### 几个刻意的设计选择
+
+- **补丁的守卫判据是「这个头有没有人发」**，不是「补丁文件在不在」。`verify-patch-retained.mjs` 要么看到补丁被正确接线且能应用到实际 tarball，要么看到 vendored bundle 自己就会发 `x-opencode-session`。两种情况都放行，其余一律拦下。
+- **只有 Fork Release 能写 update-feed。** 同步会因为合并上游发布而改动 `package.json` 的版本号，如果那时顺手刷新 feed，就会对外宣称一个还不存在的版本——应用会提示更新、下载到旧安装包、装完版本没变、无限循环。这条顺序现在由工作流结构保证，不靠人记。
+- **feed 只在 Windows 和 macOS 都发布成功后才更新。** 否则会告诉用户一个装机包还不存在的版本。
+- **合并失败不会留下半成品。** merge 用 `--no-commit` 暂存，修复和合并合成一个提交；任何一步失败就 `merge --abort`，master 保持原样。
+
+### 想改成纯手动
+
+- 只手动同步：删掉 `sync-upstream.yml` 里的 `schedule` 段
+- 只手动发版：删掉 `auto-release.yml` 里的 `workflow_run` 触发（保留 `workflow_dispatch`）
+- 重新构建同一个版本（比如构建失败后重试）：**Actions → Auto release → Run workflow** 勾上 `force`，或者直接 **Actions → Fork Release** 手动填 `version` 和 `tag`（tag 用 `v2.0.11-fork.2` 这样递增后缀）
+

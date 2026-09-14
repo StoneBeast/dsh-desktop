@@ -1,0 +1,78 @@
+name: Auto release
+
+# Cuts a release tag when master carries a version that has no release yet -- the
+# situation a sync creates when upstream publishes. The build itself is left to
+# Fork Release, which this triggers by pushing the tag: the gates and the feed
+# update then live in exactly one place.
+#
+# Remove the `workflow_run` trigger below to stop releasing automatically; the
+# manual dispatch still works.
+
+on:
+  workflow_run:
+    workflows: ['Sync upstream']
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Cut a new tag even when this version already has one
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.23.2
+
+      - name: Tag the current version when it has no release
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./dsh-plugin-desktop/package.json').version")"
+          git fetch --tags --force origin
+
+          # A real guard, not a formality: tagging a tree whose vendored patch is
+          # not wired up would burn two full runners before failing.
+          node fork/verify-patch-retained.mjs
+
+          highest="$(git tag -l "v${version}-fork.*" \
+            | sed -E 's/.*-fork\.([0-9]+)$/\1/' | sort -n | tail -1)"
+          if [[ -n "${highest:-}" && "${FORCE:-false}" != "true" ]]; then
+            {
+              echo "### Nothing to do"
+              echo
+              echo "\`$version\` is already released as \`v$version-fork.$highest\`."
+              echo "Dispatch again with **force** to cut a rebuild."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          next=$(( ${highest:-0} + 1 ))
+          tag="v${version}-fork.${next}"
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              tag -a "$tag" -m "Fork build $version"
+          git push origin "$tag"
+          {
+            echo "### Tagged \`$tag\`"
+            echo
+            echo 'Fork Release will build it. The update feed is only repointed'
+            echo 'after the assets are published, so the app never sees an'
+            echo 'advertised version it cannot download.'
+          } >> "$GITHUB_STEP_SUMMARY"
