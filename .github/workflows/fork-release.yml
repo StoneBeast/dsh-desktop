@@ -47,17 +47,28 @@ jobs:
         run: |
           set -euo pipefail
           pkg="$(node -p "require('./dsh-plugin-desktop/package.json').version")"
+
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            version="${GITHUB_REF_NAME#v}"
+            # Upstream owns tags like v2.0.10, so fork tags may carry a
+            # `-fork.N` suffix (v2.0.10-fork.1) to avoid colliding with the
+            # upstream release tag. Everything before that suffix must equal
+            # package.json exactly, so a beta tag still cannot produce a
+            # stable release.
+            tag="$GITHUB_REF_NAME"
+            base="$(printf '%s' "${tag#v}" | sed -E 's/-fork\.[0-9]+$//')"
+            if [[ "$base" != "$pkg" ]]; then
+              echo "::error::tag '$tag' does not match dsh-plugin-desktop/package.json version '$pkg' (expected v$pkg or v$pkg-fork.N)"
+              exit 1
+            fi
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
           else
-            version="${INPUT_VERSION:-$pkg}"
+            if [[ "${INPUT_VERSION:-$pkg}" != "$pkg" ]]; then
+              echo "::error::release version '${INPUT_VERSION:-}' does not match dsh-plugin-desktop/package.json version '$pkg'"
+              exit 1
+            fi
+            echo "tag=v$pkg" >> "$GITHUB_OUTPUT"
           fi
-          if [[ "$version" != "$pkg" ]]; then
-            echo "::error::release version '$version' does not match dsh-plugin-desktop/package.json version '$pkg'"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "version=$pkg" >> "$GITHUB_OUTPUT"
 
   windows:
     needs: resolve
