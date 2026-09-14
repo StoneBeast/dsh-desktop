@@ -205,7 +205,14 @@ README.i18n.yaml is stale for README.md: expected ebded1c7..., recorded 6da97144
 
 两个常见错法：把 token 建成了 **Variables**（不是 Secret）——变量不会注入 `secrets.*`；或者建在 **Environments** 下而不是仓库级。
 
-**怎么确认生效**：手动跑一次 **Actions → Sync upstream → Run workflow**，展开 `Sync upstream and re-wire the fork patch` 步骤。若输出 `sync-upstream: fork already contains upstream ...`，说明同步链路通了；token 是否被采用只有在真正需要推 workflow 文件时才会体现（届时失败信息会直接点名这个 secret）。
+**怎么确认生效** —— 不用等上游动 workflow 文件，现在就能验：
+
+1. **每次同步都会自我报告**：运行摘要里会写 `Pushing with UPSTREAM_SYNC_TOKEN` 或 `UPSTREAM_SYNC_TOKEN is not visible to this job`。后者说明名字写错、建成了 Variables、或者建在 Environments 下。
+2. **想确定 Workflows 权限真的生效**：**Actions → Sync upstream → Run workflow**，勾上 `probe_token` 再运行。它会往一个临时分支推一个一次性的 workflow 文件，然后立刻删掉那个分支——这是唯一能真正验证该权限的办法（secret 的值读不回来，fine-grained PAT 也不对外暴露自己的 scope）。
+
+   通过则摘要显示 **Token OK**；失败会直接告诉你去补 `Workflows: Read and write`。这个探针只在手动勾选时运行，不会碰 master，也不会自动触发（那个一次性 workflow 只有 `workflow_dispatch`）。
+3. 顺带一提，同一次手动运行如果输出 `sync-upstream: fork already contains upstream ...`，说明合并链路本身是通的（上游目前没有新提交时就是这个结果，无副作用）。
+
 
 ## 8. 自动化流水线
 

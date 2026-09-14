@@ -17,6 +17,12 @@ on:
     # Daily at 03:00 UTC (11:00 Asia/Shanghai). Remove this to sync by hand only.
     - cron: '0 3 * * *'
   workflow_dispatch:
+    inputs:
+      probe_token:
+        description: Also prove the token can write .github/workflows (throwaway branch, deleted right after)
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -45,6 +51,24 @@ jobs:
         with:
           node-version: 22.23.2
       - run: corepack enable
+      - name: Report the push credential
+        env:
+          HAS_SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          if [[ "$HAS_SYNC_TOKEN" == "true" ]]; then
+            echo "Pushing with \`UPSTREAM_SYNC_TOKEN\` (a sync that touches \`.github/workflows/\` can push)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### \`UPSTREAM_SYNC_TOKEN\` is not visible to this job"
+              echo
+              echo 'Falling back to `GITHUB_TOKEN`, which cannot push `.github/workflows/*`.'
+              echo 'Check the secret is named exactly `UPSTREAM_SYNC_TOKEN`, and is a'
+              echo '**repository** secret under *Secrets and variables → Actions* (not a'
+              echo 'variable, and not under *Environments*).'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::UPSTREAM_SYNC_TOKEN is not set; workflow-touching syncs will be rejected"
+          fi
       - name: Resolve Yarn cache folder
         id: yarn-cache
         run: echo "dir=$(yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
@@ -138,3 +162,49 @@ jobs:
             cat push-error.txt >> "$GITHUB_STEP_SUMMARY"
           fi
           exit 1
+
+  # Opt-in diagnostic. Nothing else can reveal whether the token really carries
+  # the `workflows` scope: a secret's value is unreadable, and a fine-grained PAT
+  # does not advertise its scopes. This pushes one throwaway workflow file to a
+  # scratch branch and deletes the branch immediately. It cannot auto-run, and it
+  # never touches master.
+  probe:
+    if: github.event_name == 'workflow_dispatch' && inputs.probe_token
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: master
+          fetch-depth: 1
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+      - name: Prove the token can write .github/workflows
+        env:
+          # Passed through the environment, never spliced into the script text.
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SYNC_TOKEN:-}" ]]; then
+            echo "::error::UPSTREAM_SYNC_TOKEN is empty, so this run would only test GITHUB_TOKEN"
+            exit 1
+          fi
+          branch="probe/workflow-write-${GITHUB_RUN_ID}"
+          printf 'name: token probe\non:\n  workflow_dispatch:\n\njobs:\n  noop:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo probe\n' \
+            > .github/workflows/zz-token-probe.yml
+          git checkout -b "$branch"
+          git add -f .github/workflows/zz-token-probe.yml
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m 'probe: workflow write permission'
+          if ! git push origin "$branch" 2>probe-error.txt; then
+            cat probe-error.txt
+            {
+              echo '### The token cannot write `.github/workflows`'
+              echo
+              echo 'Add **Workflows: Read and write** to the fine-grained PAT, update the'
+              echo '`UPSTREAM_SYNC_TOKEN` secret with the new token, and re-run this probe.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          git push origin --delete "$branch"
+          echo '### Token OK' >> "$GITHUB_STEP_SUMMARY"
+          echo 'The token can write `.github/workflows`, so syncs that touch upstream CI will push.' >> "$GITHUB_STEP_SUMMARY"
