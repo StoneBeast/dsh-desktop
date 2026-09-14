@@ -162,3 +162,42 @@ corepack yarn install --immutable                # 锁文件是否与 package.js
 `check:vendored-runtime` 是仓库自带的门禁，也是验证 `patch:` resolution 字符串逐字符正确的
 
 权威检查 —— 本 fork 的两个 channel 都已通过。
+
+---
+
+## 6. 已知问题：上游 CI 在 master 上是红的（与本 fork 无关）
+
+本 fork 的基提交是 `d61b6f9`，而**上游自己的 CI 在这个提交上就是失败的**：
+
+```
+2026-09-14T02:35:44Z | push | failure | d61b6f96 | Merge pull request #975
+2026-09-13T21:28:43Z | push | success | 697e7d78 | Merge pull request #973
+```
+
+原因在 `changes` job 的 bilingual 文档门禁，与代码无关：
+
+```
+README.i18n.yaml is stale for README.md: expected ebded1c7..., recorded 6da97144...
+```
+
+上游 PR #975 改了中文 `README.md`，但没有同步 `README.en.md`，也没有按仓库约定重新登记哈希。可以自己确认：
+
+| 文件 | 实际 blob 哈希 | `README.i18n.yaml` 记录 | 结果 |
+| --- | --- | --- | --- |
+| `README.en.md` | `8f8bce95…` | `8f8bce95…` | 一致 |
+| `README.md` | `ebded1c7…` | `6da97144…` | **不一致** |
+
+这是这个门禁在正常发挥作用 —— 它抓到了真实的翻译不同步。所以**不要**用重新登记哈希的方式把它糊过去，那等于关掉门禁并掩盖上游未翻译的内容。
+
+两个实际影响：
+
+1. `changes` job 失败会让 `check`、`desktop-windows`、`desktop-macos` 全部 **skipped**，所以上游 CI 目前在 fork 上不提供任何产品校验。
+2. 但这不影响你的构建 —— `fork-release.yml` 自己会跑 `check:win-package` 与 `check:mac-package`，这两个才是真正的产品门禁（build、typecheck、打包与运行时闭包测试）。
+
+处理建议：**保持 `ci.yml` 与上游一致、不要改它**（改了以后每次同步都要冲突）。等上游修好 README，下一次同步就会把修复带过来，CI 自动转绿。若觉得红叉吵，可以在 fork 的 Actions 页面手动 disable 这个 workflow，不需要改文件。
+
+## 7. 需要手动做的一件事：同步用的 PAT
+
+`sync-upstream.yml` 默认使用 `GITHUB_TOKEN`，它**没有 `workflows` 权限**。上游只要改动了 `.github/workflows/` 下的任何文件，合并后的 push 就会被拒绝（工作流会打印出这条原因，不会留下半个合并）。
+
+设置一次即可：仓库 **Settings → Secrets and variables → Actions → New repository secret**，名称 `UPSTREAM_SYNC_TOKEN`，值是 fine-grained PAT，权限勾选 **Contents: Read and write** 与 **Workflows: Read and write**。工作流检测到该 secret 就会优先使用它。
