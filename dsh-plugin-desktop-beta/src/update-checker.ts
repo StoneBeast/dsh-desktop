@@ -7,7 +7,7 @@ import {
 } from './desktop-installation-id.ts'
 
 /** Public endpoint returning the latest DSH Desktop version for a requested channel. */
-export const DESKTOP_VERSION_ENDPOINT = 'https://www.dshdesktop.cn/api/desktop/version'
+export const DESKTOP_VERSION_ENDPOINT = 'https://raw.githubusercontent.com/StoneBeast/dsh-desktop/master/fork/update-feed/beta.json'
 
 /** Header carrying the installed Desktop version to the fixed version endpoint. */
 export const DESKTOP_CURRENT_VERSION_HEADER = 'X-DSH-Desktop-Version'

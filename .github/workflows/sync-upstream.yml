@@ -1,0 +1,126 @@
+name: Sync upstream
+
+# Merges anywhere-labs/dsh-desktop's master into this fork's master.
+#
+# The fork is always diverged (it carries the PR #946 patch commit), so GitHub's
+# built-in "Sync fork" fast-forward cannot be used -- this runs a real merge.
+#
+# Safety: the merged tree is validated BEFORE it is pushed. If upstream bumps the
+# vendored runtime version, the fork's opencode-go patch stops being referenced
+# and every ordinary gate would still pass while the fix silently disappears;
+# `fork/verify-patch-retained.mjs` catches exactly that and aborts the push.
+
+on:
+  schedule:
+    # Daily at 03:00 UTC. Adjust or remove if you prefer manual syncs.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: master
+          fetch-depth: 0
+          # GITHUB_TOKEN cannot push changes to .github/workflows/*, so a merge
+          # that touches upstream's ci.yml is rejected. Set UPSTREAM_SYNC_TOKEN
+          # to a fine-grained PAT with Contents:write and Workflows:write to
+          # make every sync pushable; otherwise the default token is used and
+          # workflow-touching merges fail loudly.
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.23.2
+
+      - name: Merge upstream master
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/anywhere-labs/dsh-desktop.git
+          git fetch --no-tags upstream master
+
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "Fork already contains upstream master."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "upstream=$(git rev-parse --short upstream/master)" >> "$GITHUB_OUTPUT"
+          if ! git merge --no-edit upstream/master; then
+            git merge --abort || true
+            {
+              echo "::error::Upstream master conflicts with this fork's local commits."
+              echo "Resolve locally, then re-run this workflow:"
+              echo "  git fetch upstream && git merge upstream/master"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the fork patch survived the merge
+        id: guard
+        if: steps.merge.outputs.changed == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          node fork/verify-patch-retained.mjs
+          node scripts/sync-vendored-runtime.mjs --check --channel stable
+          node scripts/sync-vendored-runtime.mjs --check --channel beta
+
+      - name: Explain a failed guard
+        if: steps.merge.outputs.changed == 'true' && steps.guard.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream }}
+        run: |
+          set -euo pipefail
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ### Upstream bumped the vendored runtime
+
+          The merge is valid, but the fork's opencode-go patch is no longer wired
+          up, so nothing was pushed. Re-port it:
+
+          1. Read the new `runtimePackageVersion` in `upstream.json`.
+          2. Move `patches/dsh-llm-pi-ai@<old>.patch` to `patches/dsh-llm-pi-ai@<new>.patch`
+             and re-check it against the new tarball (`node fork/verify-patch-retained.mjs` fails with the diff).
+          3. `corepack yarn install` to rewrite the `patch:` resolutions and `yarn.lock`.
+          4. Re-run this workflow.
+          EOF
+          body="$(printf 'Upstream moved to `%s`. The fork patch is no longer referenced, so the sync was aborted before pushing.\n\nSee the [Actions run](%s/%s/actions/runs/%s) for the exact failure.\n' \
+            "$UPSTREAM_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")"
+          gh issue create --title "Upstream sync blocked: re-port the opencode-go patch" --body "$body" \
+            || echo "::warning::could not open a tracking issue"
+          exit 1
+
+      - name: Push
+        if: steps.merge.outputs.changed == 'true' && steps.guard.outcome == 'success'
+        run: |
+          set -euo pipefail
+          if git push origin HEAD:master 2>push-error.txt; then
+            echo "Merged upstream ${{ steps.merge.outputs.upstream }} into master." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          cat push-error.txt
+          if grep -qi 'workflow' push-error.txt; then
+            cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+            ### Push rejected: `.github/workflows/*` needs a token with the `workflows` scope
+
+            The default `GITHUB_TOKEN` cannot create or update workflow files, and this
+            merge touched them. Nothing was pushed; the merge exists only in this runner.
+
+            Fix: add a repository secret named `UPSTREAM_SYNC_TOKEN` holding a
+            fine-grained PAT with **Contents: write** and **Workflows: write**, then
+            re-run this workflow. The workflow already prefers that secret when present.
+            EOF
+          else
+            cat push-error.txt >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 1

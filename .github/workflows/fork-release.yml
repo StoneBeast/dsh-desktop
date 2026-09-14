@@ -1,0 +1,176 @@
+name: Fork Release
+
+# Builds this fork's own installers on GitHub-hosted runners and publishes them
+# as a GitHub Release on this fork, so no local toolchain is required.
+#
+# Windows produces an unsigned NSIS installer plus a portable archive (the same
+# artifacts upstream's own CI builds). macOS produces an unsigned universal DMG.
+# Neither job needs signing secrets; see fork/README.md for what signing would
+# add and why upstream keeps it on a credentialed machine.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version; must equal dsh-plugin-desktop/package.json version
+        required: true
+        type: string
+      build_macos:
+        description: Also build the unsigned universal DMG
+        required: false
+        default: true
+        type: boolean
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.derive.outputs.version }}
+      tag: ${{ steps.derive.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - id: derive
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          pkg="$(node -p "require('./dsh-plugin-desktop/package.json').version")"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${INPUT_VERSION:-$pkg}"
+          fi
+          if [[ "$version" != "$pkg" ]]; then
+            echo "::error::release version '$version' does not match dsh-plugin-desktop/package.json version '$pkg'"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: resolve
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.23.2
+      - run: corepack enable
+      - name: Resolve Yarn cache folder
+        id: yarn-cache
+        shell: bash
+        run: echo "dir=$(yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        with:
+          path: ${{ steps.yarn-cache.outputs.dir }}
+          key: yarn-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('yarn.lock', '.yarnrc.yml') }}
+      - run: yarn install --immutable
+      - name: Windows product gate
+        run: yarn workspace dsh-plugin-desktop check:win-package
+      # Each artifact is staged right after its own build: both runs share
+      # `dsh-plugin-desktop/dist`, and electron-builder may clear that directory
+      # before packaging, which would drop the other target's output.
+      - name: Build Windows installer (NSIS)
+        shell: bash
+        env:
+          DSH_PACKAGE_CHECK_ALREADY_RAN: '1'
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          yarn workspace dsh-plugin-desktop dist:win
+          mkdir -p release-assets
+          cp "dsh-plugin-desktop/dist/DSH-Desktop-${VERSION}-x64-Setup.exe" \
+             release-assets/DSH-Desktop-windows-x64-Setup.exe
+      - name: Build Windows portable archive
+        shell: bash
+        env:
+          DSH_PACKAGE_CHECK_ALREADY_RAN: '1'
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          yarn workspace dsh-plugin-desktop dist:win-portable
+          mkdir -p release-assets
+          cp "dsh-plugin-desktop/dist/DSH-Desktop-${VERSION}-x64-Portable.zip" \
+             release-assets/DSH-Desktop-windows-x64-Portable.zip
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "Fork build $VERSION" \
+                 --notes "Fork build of DSH Desktop $VERSION, including the PR #946 opencode-go session header fix." \
+                 --target "$GITHUB_SHA"
+          gh release upload "$TAG" release-assets/* --clobber
+
+  macos:
+    needs: resolve
+    if: ${{ github.event_name == 'push' || inputs.build_macos }}
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.23.2
+      - run: corepack enable
+      - name: Resolve Yarn cache folder
+        id: yarn-cache
+        shell: bash
+        run: echo "dir=$(yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        with:
+          path: ${{ steps.yarn-cache.outputs.dir }}
+          key: yarn-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('yarn.lock', '.yarnrc.yml') }}
+      - run: yarn install --immutable
+      - name: macOS product gate
+        run: yarn workspace dsh-plugin-desktop check:mac-package
+      - name: Build unsigned universal DMG
+        env:
+          DSH_PACKAGE_CHECK_ALREADY_RAN: '1'
+        run: yarn workspace dsh-plugin-desktop dist:mac-smoke
+      - name: Stage stable asset name for the update feed
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          dmg="$(find dsh-plugin-desktop/dist/mac-smoke -maxdepth 1 -name '*.dmg' -print -quit)"
+          if [[ -z "$dmg" ]]; then
+            echo "::error::dist:mac-smoke produced no DMG"
+            exit 1
+          fi
+          cp "$dmg" release-assets/DSH-Desktop-mac-universal.dmg
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "Fork build $VERSION" \
+                 --notes "Fork build of DSH Desktop $VERSION, including the PR #946 opencode-go session header fix." \
+                 --target "$GITHUB_SHA"
+          gh release upload "$TAG" release-assets/* --clobber
